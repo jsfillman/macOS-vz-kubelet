@@ -9,6 +9,9 @@ type Config struct {
 	HardwareModelData string      `json:"hardwareModelData"`
 	MachineIdData     string      `json:"machineIdData"`
 	Storage           []MediaType `json:"-"`
+	// SourceFormat indicates the original image format: "oras" or "tart".
+	// Useful for debugging and metrics.
+	SourceFormat string `json:"sourceFormat,omitempty"`
 }
 
 // NewMacOSConfig creates a new Bundle tailored for macOS OCI images.

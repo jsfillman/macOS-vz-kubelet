@@ -2,6 +2,7 @@ package downloader
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -137,7 +138,35 @@ func pull(ctx context.Context, ref string, store *oci.Store, creds resource.Regi
 		return nil, err
 	}
 
+	// Fetch manifest to determine format and trigger format-specific processing
+	manifest, err := fetchManifest(ctx, repo, descOras)
+	if err != nil {
+		return nil, fmt.Errorf("fetch manifest: %w", err)
+	}
+
+	// Handle format-specific manifest processing (e.g., Tart LZ4 decompression)
+	if err := store.HandleManifest(ctx, manifest); err != nil {
+		return nil, fmt.Errorf("handle manifest: %w", err)
+	}
+
 	return &descOras, nil
+}
+
+// fetchManifest retrieves the manifest for format detection.
+// Note: We fetch from repo (remote) because store may not expose manifest directly.
+// This is a small additional request but keeps Store interface simple.
+func fetchManifest(ctx context.Context, repo *remote.Repository, desc ocispec.Descriptor) (ocispec.Manifest, error) {
+	rc, err := repo.Fetch(ctx, desc)
+	if err != nil {
+		return ocispec.Manifest{}, fmt.Errorf("fetch manifest blob: %w", err)
+	}
+	defer rc.Close()
+
+	var manifest ocispec.Manifest
+	if err := json.NewDecoder(rc).Decode(&manifest); err != nil {
+		return ocispec.Manifest{}, fmt.Errorf("decode manifest: %w", err)
+	}
+	return manifest, nil
 }
 
 func toORASCredential(creds resource.RegistryCredentials) auth.Credential {
