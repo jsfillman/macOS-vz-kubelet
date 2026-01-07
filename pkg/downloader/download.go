@@ -107,6 +107,7 @@ func Download(ctx context.Context, params Params, eventRecorder event.EventRecor
 		AuxiliaryStoragePath:  auxStoragePath,
 		HardwareModelData:     c.HardwareModelData,
 		MachineIdentifierData: c.MachineIdData,
+		SourceFormat:          c.SourceFormat,
 	}, nil
 }
 

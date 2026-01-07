@@ -59,7 +59,11 @@ func (tc *TartConfig) ToConfig() Config {
 		OS:                tc.OS,
 		HardwareModelData: tc.HardwareModel,
 		MachineIdData:     tc.ECID,
-		SourceFormat:      "tart",
+		Storage: []MediaType{
+			MediaTypeAuxImage,  // NVRAM
+			MediaTypeDiskImage, // Disk
+		},
+		SourceFormat: "tart",
 	}
 }
 

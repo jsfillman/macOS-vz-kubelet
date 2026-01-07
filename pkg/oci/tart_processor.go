@@ -93,7 +93,8 @@ func (s *Store) processTartManifest(ctx context.Context, manifest ocispec.Manife
 	logger.Infof("Disk image assembled successfully: %s", diskPath)
 
 	// Process NVRAM layer (direct copy, NOT LZ4 decompression)
-	nvramPath := filepath.Join(s.workingDir, "nvram.bin")
+	// Use aux.img as filename to match our internal media type mapping
+	nvramPath := filepath.Join(s.workingDir, "aux.img")
 	logger.Infof("Processing NVRAM to: %s", nvramPath)
 	if err := s.DecompressSingleLZ4Layer(ctx, *nvramLayer, nvramPath); err != nil {
 		logger.Errorf("Failed to process NVRAM: %v", err)

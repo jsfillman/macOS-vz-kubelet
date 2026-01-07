@@ -18,6 +18,7 @@ type MacPlatformConfigurationOptions struct {
 	AuxiliaryStoragePath  string
 	HardwareModelData     string
 	MachineIdentifierData string
+	SourceFormat          string // "oras" or "tart" - indicates the original image format
 }
 
 // PlatformConfiguration holds the configuration for the platform, including storage paths and overlay usage.
@@ -58,12 +59,8 @@ func NewPlatformConfiguration(ctx context.Context, opts MacPlatformConfiguration
 	_ = span.WithFields(ctx, log.Fields{
 		"blockStoragePath":     blockStoragePath,
 		"auxiliaryStoragePath": auxiliaryStoragePath,
+		"sourceFormat":         opts.SourceFormat,
 	})
-
-	auxiliaryStorage, err := vz.NewMacAuxiliaryStorage(auxiliaryStoragePath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create a new mac auxiliary storage: %w", err)
-	}
 
 	decodedHardwareModelData, err := base64.StdEncoding.DecodeString(opts.HardwareModelData)
 	if err != nil {
@@ -73,6 +70,21 @@ func NewPlatformConfiguration(ctx context.Context, opts MacPlatformConfiguration
 	hardwareModel, err := vz.NewMacHardwareModelWithData(decodedHardwareModelData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create a new hardware model: %w", err)
+	}
+
+	// Create auxiliary storage (NVRAM)
+	// For Tart images, create fresh NVRAM to avoid state conflicts
+	// For ORAS images, load existing NVRAM as they're built specifically for this kubelet
+	var auxiliaryStorage *vz.MacAuxiliaryStorage
+	if opts.SourceFormat == "tart" {
+		log.G(ctx).Info("Creating fresh auxiliary storage for Tart image")
+		auxiliaryStorage, err = vz.NewMacAuxiliaryStorage(auxiliaryStoragePath, vz.WithCreatingMacAuxiliaryStorage(hardwareModel))
+	} else {
+		log.G(ctx).Info("Loading existing auxiliary storage")
+		auxiliaryStorage, err = vz.NewMacAuxiliaryStorage(auxiliaryStoragePath)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to create auxiliary storage: %w", err)
 	}
 
 	decodedMachineIdentifierData, err := base64.StdEncoding.DecodeString(opts.MachineIdentifierData)
