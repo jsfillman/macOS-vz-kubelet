@@ -73,6 +73,12 @@ func New(workingDir string, ignoreExisting bool, eventRecorder event.EventRecord
 		return nil, fmt.Errorf("failed to resolve absolute path for %s: %w", workingDir, err)
 	}
 
+	// Create OCI layout directory structure
+	blobsDir := filepath.Join(workingDirAbs, "blobs", "sha256")
+	if err := os.MkdirAll(blobsDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create blobs directory: %w", err)
+	}
+
 	return &Store{
 		workingDir:     workingDirAbs,
 		ignoreExisting: ignoreExisting,
@@ -80,6 +86,89 @@ func New(workingDir string, ignoreExisting bool, eventRecorder event.EventRecord
 
 		memoryStore: memory.New(),
 	}, nil
+}
+
+// blobPath returns the filesystem path for a blob with the given digest.
+// Format: <workingDir>/blobs/sha256/<digest>
+func (s *Store) blobPath(d digest.Digest) string {
+	return filepath.Join(s.workingDir, "blobs", d.Algorithm().String(), d.Encoded())
+}
+
+// blobExists checks if a blob exists and optionally validates its size.
+func (s *Store) blobExists(d digest.Digest, expectedSize int64) bool {
+	path := s.blobPath(d)
+	stat, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+
+	// Validate size if provided
+	if expectedSize > 0 && stat.Size() != expectedSize {
+		// Size mismatch indicates corruption, remove it
+		os.Remove(path)
+		return false
+	}
+
+	return true
+}
+
+// pushBlob writes a blob to the OCI layout with atomic write and digest validation.
+// It writes to a .partial file first, validates the digest, then atomically renames.
+func (s *Store) pushBlob(ctx context.Context, expected ocispec.Descriptor, content io.Reader) error {
+	logger := log.G(ctx)
+	blobPath := s.blobPath(expected.Digest)
+	partialPath := blobPath + ".partial"
+
+	// Create partial file
+	partialFile, err := os.Create(partialPath)
+	if err != nil {
+		return fmt.Errorf("create partial file: %w", err)
+	}
+	defer func() {
+		partialFile.Close()
+		// Clean up partial file on error (but not on success - it's renamed)
+		if err != nil {
+			os.Remove(partialPath)
+		}
+	}()
+
+	// Write content while computing digest
+	hasher := expected.Digest.Algorithm().Hash()
+	if hasher == nil {
+		return fmt.Errorf("unsupported digest algorithm: %s", expected.Digest.Algorithm())
+	}
+	writer := io.MultiWriter(partialFile, hasher)
+
+	bytesWritten, err := io.Copy(writer, content)
+	if err != nil {
+		return fmt.Errorf("write blob: %w", err)
+	}
+
+	// Sync to disk before validation
+	if err := partialFile.Sync(); err != nil {
+		return fmt.Errorf("sync partial file: %w", err)
+	}
+	partialFile.Close()
+
+	// Validate digest
+	computedHex := fmt.Sprintf("%x", hasher.Sum(nil))
+	computedDigest := digest.NewDigestFromEncoded(expected.Digest.Algorithm(), computedHex)
+	if computedDigest != expected.Digest {
+		return fmt.Errorf("digest mismatch: expected %s, computed %s", expected.Digest, computedDigest)
+	}
+
+	// Validate size
+	if expected.Size > 0 && bytesWritten != expected.Size {
+		return fmt.Errorf("size mismatch: expected %d bytes, wrote %d bytes", expected.Size, bytesWritten)
+	}
+
+	// Atomic rename (only if validation passed)
+	if err := os.Rename(partialPath, blobPath); err != nil {
+		return fmt.Errorf("rename to final path: %w", err)
+	}
+
+	logger.Infof("Cached blob %s to %s (%d bytes)", expected.Digest.String()[:12], blobPath, bytesWritten)
+	return nil
 }
 
 // Close closes the Store, removing any temporary files and marking the store as closed.
@@ -131,7 +220,13 @@ func (s *Store) Fetch(ctx context.Context, target ocispec.Descriptor) (fp io.Rea
 		return nil, ErrStoreClosed
 	}
 
-	// check if the content exists in the store
+	// Check OCI layout blob directory first (new path)
+	blobPath := s.blobPath(target.Digest)
+	if fp, err = os.Open(blobPath); err == nil {
+		return fp, nil
+	}
+
+	// Backward compatibility: check digestToPath (legacy temp files)
 	val, exists := s.digestToPath.Load(target.Digest)
 	if exists {
 		path, ok := val.(string)
@@ -177,29 +272,28 @@ func (s *Store) Push(ctx context.Context, expected ocispec.Descriptor, content i
 	logger.Infof("Push called: mediaType=%s, digest=%s, size=%d, name=%q",
 		expected.MediaType, expected.Digest.String()[:12], expected.Size, name)
 
-	// Special handling for Tart layers: they don't have AnnotationTitle but need temp file caching
-	if name == "" {
-		if IsTartMediaType(expected.MediaType) {
-			logger.Infof("Detected Tart layer, writing to temp file: %s", expected.MediaType)
-			// Write Tart layers to temp files for efficient streaming during decompression
-			fp, err := s.tempFile()
-			if err != nil {
-				return fmt.Errorf("failed to create temp file for Tart layer: %w", err)
-			}
-			defer fp.Close()
-
-			if err := s.saveFile(ctx, fp, expected, content); err != nil {
-				return fmt.Errorf("failed to save Tart layer to temp file: %w", err)
-			}
-
-			// Store the digest to path mapping for later Fetch()
-			s.digestToPath.Store(expected.Digest, fp.Name())
-			logger.Infof("Cached Tart layer %s to temp file %s (size: %d bytes)", expected.Digest.String()[:12], fp.Name(), expected.Size)
-			return nil
+	// Check if blob already exists in OCI layout (enables resume!)
+	if s.blobExists(expected.Digest, expected.Size) {
+		logger.Infof("Blob %s already exists, skipping download", expected.Digest.String()[:12])
+		// Still register in mediaTypeToPath for ORAS layers with names
+		if name != "" {
+			s.mediaTypeToPath.Store(string(expected.MediaType), s.blobPath(expected.Digest))
 		}
-		// Non-Tart content without title goes to memory store
-		logger.Infof("No title, not Tart - storing in memory: mediaType=%s", expected.MediaType)
-		return s.memoryStore.Push(ctx, expected, content)
+		return nil
+	}
+
+	// Layers without AnnotationTitle (Tart layers, manifests, etc)
+	if name == "" {
+		// Small content (manifests, configs) goes to memory store
+		if expected.Size < 1024*1024 { // < 1MB
+			logger.Infof("Small content, storing in memory: mediaType=%s", expected.MediaType)
+			return s.memoryStore.Push(ctx, expected, content)
+		}
+
+		// Large content (Tart disk layers) goes to blob store with atomic write
+		logger.Infof("Large layer detected, writing to blob store: %s (%d bytes)",
+			expected.MediaType, expected.Size)
+		return s.pushBlob(ctx, expected, content)
 	}
 
 	// check the status of the name
@@ -229,6 +323,7 @@ func (s *Store) Push(ctx context.Context, expected ocispec.Descriptor, content i
 }
 
 // Exists checks whether content exists in the store or on disk, validating it if necessary.
+// This is called by ORAS before downloading each layer - if it returns true, the layer is skipped.
 func (s *Store) Exists(ctx context.Context, target ocispec.Descriptor) (ok bool, err error) {
 	ctx, span := trace.StartSpan(ctx, "OCI.Exists")
 	ctx = span.WithFields(ctx, log.Fields{
@@ -245,9 +340,19 @@ func (s *Store) Exists(ctx context.Context, target ocispec.Descriptor) (ok bool,
 		return false, ErrStoreClosed
 	}
 
-	// check if the content exists in the store
+	// Check OCI layout blob directory first (enables resume!)
+	if s.blobExists(target.Digest, target.Size) {
+		return true, nil
+	}
+
+	// Check if the content exists in mediaTypeToPath (legacy ORAS layers)
 	_, exists := s.mediaTypeToPath.Load(target.MediaType)
 	if exists {
+		return true, nil
+	}
+
+	// Check memory store for small content
+	if ok, _ := s.memoryStore.Exists(ctx, target); ok {
 		return true, nil
 	}
 

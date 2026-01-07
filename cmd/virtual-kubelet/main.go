@@ -88,9 +88,26 @@ func main() {
 			kubeConfigPath = filepath.Join(home, ".kube", "config")
 		}
 	}
+
+	// Validate kubeconfig path exists before attempting to use it
+	if kubeConfigPath != "" {
+		if _, err := os.Stat(kubeConfigPath); os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "Error: kubeconfig file not found at %s\n", kubeConfigPath)
+			fmt.Fprintf(os.Stderr, "Please set KUBECONFIG environment variable or ensure ~/.kube/config exists\n")
+			os.Exit(1)
+		}
+	}
+
 	k8sClient, err := nodeutil.ClientsetFromEnv(kubeConfigPath)
 	if err != nil {
-		log.G(ctx).Fatal(err)
+		fmt.Fprintf(os.Stderr, "Error creating Kubernetes client: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Kubeconfig path: %s\n", kubeConfigPath)
+		os.Exit(1)
+	}
+
+	if k8sClient == nil {
+		fmt.Fprintf(os.Stderr, "Error: Kubernetes client is nil\n")
+		os.Exit(1)
 	}
 
 	cmd := &cobra.Command{
@@ -244,6 +261,14 @@ func withClient(c kubernetes.Interface, cfg *nodeutil.NodeConfig) error {
 	return nodeutil.WithClient(c)(cfg)
 }
 
+func withKeyPair(cfg *nodeutil.NodeConfig) error {
+	// Only configure TLS if both cert and key paths are provided
+	if certPath == "" || keyPath == "" {
+		return nil
+	}
+	return nodeutil.WithTLSConfig(nodeutil.WithKeyPairFromPath(certPath, keyPath), withCA)(cfg)
+}
+
 func withCA(cfg *tls.Config) error {
 	if clientCACert == "" {
 		return nil
@@ -344,7 +369,7 @@ func run(ctx context.Context, c kubernetes.Interface) error {
 		withTaint,
 		withProviderID,
 		withVersion,
-		nodeutil.WithTLSConfig(nodeutil.WithKeyPairFromPath(certPath, keyPath), withCA),
+		withKeyPair,
 		func(cfg *nodeutil.NodeConfig) error {
 			return withWebhookAuth(ctx, cfg)
 		},

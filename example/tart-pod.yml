@@ -5,7 +5,7 @@ metadata:
 spec:
   containers:
   - name: macos
-    image: ghcr.io/cirruslabs/macos-sequoia-base:16
+    image: ghcr.io/cirruslabs/macos-sequoia-base:latest
     resources:
       requests:
         cpu: 4
