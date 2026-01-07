@@ -174,7 +174,31 @@ func (s *Store) Push(ctx context.Context, expected ocispec.Descriptor, content i
 	}
 
 	name := expected.Annotations[ocispec.AnnotationTitle]
+	logger.Infof("Push called: mediaType=%s, digest=%s, size=%d, name=%q",
+		expected.MediaType, expected.Digest.String()[:12], expected.Size, name)
+
+	// Special handling for Tart layers: they don't have AnnotationTitle but need temp file caching
 	if name == "" {
+		if IsTartMediaType(expected.MediaType) {
+			logger.Infof("Detected Tart layer, writing to temp file: %s", expected.MediaType)
+			// Write Tart layers to temp files for efficient streaming during decompression
+			fp, err := s.tempFile()
+			if err != nil {
+				return fmt.Errorf("failed to create temp file for Tart layer: %w", err)
+			}
+			defer fp.Close()
+
+			if err := s.saveFile(ctx, fp, expected, content); err != nil {
+				return fmt.Errorf("failed to save Tart layer to temp file: %w", err)
+			}
+
+			// Store the digest to path mapping for later Fetch()
+			s.digestToPath.Store(expected.Digest, fp.Name())
+			logger.Infof("Cached Tart layer %s to temp file %s (size: %d bytes)", expected.Digest.String()[:12], fp.Name(), expected.Size)
+			return nil
+		}
+		// Non-Tart content without title goes to memory store
+		logger.Infof("No title, not Tart - storing in memory: mediaType=%s", expected.MediaType)
 		return s.memoryStore.Push(ctx, expected, content)
 	}
 

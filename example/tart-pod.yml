@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-tart-sequoia
+spec:
+  containers:
+  - name: macos
+    image: ghcr.io/cirruslabs/macos-sequoia-base:16
+    resources:
+      requests:
+        cpu: 4
+        memory: 8Gi
+  tolerations:
+  - key: "virtual-kubelet.io/provider"
+    operator: "Equal"
+    value: "macos-vz"
+    effect: "NoSchedule"
+  nodeSelector:
+    kubernetes.io/os: "darwin"

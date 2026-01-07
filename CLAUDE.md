@@ -114,26 +114,121 @@ Both produce identical VM artifacts (disk.img, nvram.bin). By extending the exis
 
 ## Implementation Roadmap
 
-| Phase | Focus | Key Deliverables |
-|-------|-------|------------------|
-| 1 | Tart image support | Native LZ4 decompression, Tart media type detection, unified OCI store |
-| 2 | Enhanced VM lifecycle | APFS CoW overlays, graceful shutdown, Prometheus metrics |
-| 3 | Production hardening | Health checks, resource limits, error recovery |
+| Phase | Focus | Key Deliverables | Status |
+|-------|-------|------------------|--------|
+| 1 | Tart image support | Tart media type detection, multi-layer disk assembly, config parsing | ✅ Done |
+| 1.5 | OCI Layout compliance | Resumable downloads, standard blob storage, cache persistence | 📋 Planned |
+| 2 | Enhanced VM lifecycle | APFS CoW overlays, graceful shutdown, Prometheus metrics | 📋 Planned |
+| 3 | Production hardening | Health checks, resource limits, error recovery | 📋 Planned |
 
 ---
 
-## Phase 1: Native Tart Image Support
+## Phase 1: Native Tart Image Support ✅
 
-See [tickets/01-LZ4.md](tickets/01-LZ4.md) for detailed implementation spec.
+**Status:** Completed
 
-**Summary:**
-- Add `github.com/pierrec/lz4/v4` dependency
-- Implement Tart media type detection (`application/vnd.cirruslabs.tart.*`)
-- Handle multi-layer LZ4 disk decompression (layers must be sequential)
+**Key findings:**
+- Tart layers in OCI registries are stored as **raw, uncompressed disk chunks** (not LZ4)
+- Each layer starts with `bv41` magic number (Tart's chunk format)
+- NVRAM and config layers are also uncompressed
+- No LZ4 dependency needed
+
+**Implementation:**
+- Tart media type detection (`application/vnd.cirruslabs.tart.*`)
+- Sequential layer concatenation for disk assembly
 - Parse Tart config from `layers[0]` (not `manifest.Config`)
-- Map Tart config to internal format
+- Map Tart config to internal VMImage format
+- Support for both ORAS and Tart image formats in unified Store
 
-**Exit criteria:** `ghcr.io/cirruslabs/macos-sequoia-xcode:16` pulls and boots successfully.
+**Exit criteria:** ✅ `ghcr.io/cirruslabs/macos-sequoia-xcode:16` pulls and boots successfully.
+
+---
+
+## Phase 1.5: OCI Layout Compliance & Resumable Downloads
+
+**Problem:** Current implementation uses temp files with in-memory digest mapping. On restart, all download progress is lost and images must be re-downloaded (100GB+ for full Xcode images).
+
+**Solution:** Adopt OCI Image Layout specification for standard-compliant blob storage.
+
+### Architecture Changes
+
+```
+Before (temp files):
+/var/folders/.../T/
+  macosvz_file_1234  (lost on restart)
+  macosvz_file_5678  (lost on restart)
+
+After (OCI layout):
+~/Library/Caches/com.agoda.fleet.virtualization/blobs/
+  sha256/
+    abc123def...  (permanent, validated)
+    456789ghi...  (permanent, validated)
+  oci-layout      (version marker)
+```
+
+### Implementation
+
+**1. Store refactor (pkg/oci/store.go):**
+```go
+type Store struct {
+    blobsDir string  // e.g., blobs/sha256/
+}
+
+func (s *Store) Push(ctx context.Context, expected ocispec.Descriptor, content io.Reader) error {
+    blobPath := filepath.Join(s.blobsDir, expected.Digest.Algorithm().String(),
+                              expected.Digest.Encoded())
+
+    // Check if already exists (enables resume)
+    if s.validateBlob(blobPath, expected) {
+        return nil  // Skip download
+    }
+
+    // Atomic write (temp + validate + rename)
+    tmpPath := blobPath + ".partial"
+    // Write with digest validation...
+    os.Rename(tmpPath, blobPath)
+}
+
+func (s *Store) Fetch(ctx context.Context, desc ocispec.Descriptor) (io.ReadCloser, error) {
+    blobPath := filepath.Join(s.blobsDir, desc.Digest.Algorithm().String(),
+                              desc.Digest.Encoded())
+    return os.Open(blobPath)
+}
+
+func (s *Store) Exists(desc ocispec.Descriptor) bool {
+    blobPath := filepath.Join(s.blobsDir, desc.Digest.Algorithm().String(),
+                              desc.Digest.Encoded())
+    return s.validateBlob(blobPath, desc)
+}
+```
+
+**2. Migration path:**
+- Detect legacy temp file cache
+- Provide migration tool or warning
+- Support both formats during transition
+
+**3. Benefits:**
+- ✅ **Resumable downloads**: ORAS checks `Exists()` before downloading each layer
+- ✅ **Survives restarts**: Blobs persist across crashes/restarts
+- ✅ **Standard compliance**: Compatible with OCI tooling (skopeo, crane, etc.)
+- ✅ **Cache pre-warming**: Can use external tools to populate cache
+- ✅ **Atomic operations**: `.partial` files indicate incomplete downloads
+- ✅ **Digest validation**: Every blob validated on write
+
+**4. Testing:**
+- Interrupt download mid-pull, verify resume
+- Restart kubelet during download, verify resume
+- Corrupt blob file, verify re-download
+- Performance: measure cache hit speedup
+
+**Exit criteria:**
+- Download can be interrupted and resumed without re-downloading
+- 100GB+ images can be pulled reliably
+- Compatible with OCI ecosystem tools
+
+**Effort estimate:** 4-6 days
+
+---
 
 ---
 
@@ -265,6 +360,43 @@ kubectl exec test-tart -- sw_vers
 | `pkg/vm/overlay.go` | APFS copy-on-write cloning |
 | `pkg/downloader/` | Image pull orchestration |
 | `cmd/vz-kubelet/` | Main binary entrypoint |
+
+---
+
+## Implementation Learnings
+
+### Tart Image Format Reality vs. Documentation
+
+**Issue:** Initial implementation attempted LZ4 decompression of Tart disk layers, resulting in deadlock.
+
+**Root cause:** Despite Tart's historical use of LZ4 compression, layers in ghcr.io OCI registries are stored as **raw, uncompressed disk chunks**.
+
+**Evidence:**
+```bash
+$ hexdump -C layer.blob | head -3
+00000000  62 76 34 31 00 00 01 00  # "bv41" magic number
+00000010  01 53 00 00 c0 99 88 77  # Tart chunk header
+```
+
+**Correct implementation:**
+- Disk layers: Sequential concatenation (no decompression)
+- NVRAM layer: Direct copy (no decompression)
+- Config layer: JSON parse (no decompression)
+
+**Debugging technique:**
+```bash
+# Test LZ4 decompression on suspected layer
+echo 'package main
+import ("github.com/pierrec/lz4/v4"; "io"; "os")
+func main() {
+    f, _ := os.Open(os.Args[1])
+    r := lz4.NewReader(f)
+    io.Copy(os.Stdout, r)  // Will fail with "bad magic number" if not LZ4
+}' > test.go
+go run test.go layer.blob
+```
+
+**Takeaway:** Always validate compression format with hex inspection before implementing decompression logic. Media type alone is insufficient.
 
 ---
 
