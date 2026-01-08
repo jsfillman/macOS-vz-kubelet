@@ -265,9 +265,10 @@ func (c *MacOSClient) DeleteVirtualMachine(ctx context.Context, namespace string
 		span.End()
 	}()
 
+	logger := log.G(ctx)
 	info, ok := c.data.GetVirtualMachineInfo(namespace, name)
 	if !ok {
-		log.G(ctx).Debugf("virtual machine not found for namespace %s and name %s", namespace, name)
+		logger.Debugf("virtual machine not found for namespace %s and name %s", namespace, name)
 		return nil
 	}
 	defer c.data.RemoveVirtualMachineInfo(namespace, name)
@@ -277,7 +278,15 @@ func (c *MacOSClient) DeleteVirtualMachine(ctx context.Context, namespace string
 	}
 
 	if instance := info.Resource.Instance(); instance != nil {
+		logger.Info("Stopping virtual machine instance")
 		err = c.stopVirtualMachine(ctx, instance, namespace, name, gracePeriod)
+		if err != nil {
+			logger.WithError(err).Error("Failed to stop virtual machine instance")
+		} else {
+			logger.Info("Successfully stopped virtual machine instance")
+		}
+	} else {
+		logger.Warn("Virtual machine instance is nil, skipping stop (overlays may have been cleaned up in setupVM)")
 	}
 
 	return err
@@ -565,18 +574,39 @@ func (c *MacOSClient) canProceedWithVirtualMachineCreation() bool {
 
 // setupVM creates a new virtual machine instance with the given parameters.
 func setupVM(ctx context.Context, cfg config.MacPlatformConfigurationOptions, uid string, cpu uint, memorySize uint64, networkInterfaceIdentifier string, mounts []volumes.Mount) (*vm.VirtualMachineInstance, error) {
-	log.G(ctx).Debugf("Creating virtual machine with CPU: %d, memory: %d, network interface: %s, mounts: %+v", cpu, memorySize, networkInterfaceIdentifier, mounts)
+	logger := log.G(ctx)
+	logger.Debugf("Creating virtual machine with CPU: %d, memory: %d, network interface: %s, mounts: %+v", cpu, memorySize, networkInterfaceIdentifier, mounts)
+
 	platformConfig, err := config.NewPlatformConfiguration(ctx, cfg, true, uid)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create platform configuration: %w", err)
 	}
+
+	// Cleanup overlays on failure
+	var vmInstance *vm.VirtualMachineInstance
+	defer func() {
+		if err != nil && vmInstance == nil && platformConfig.IsOverlay {
+			// VM creation failed but overlays were created - clean them up
+			logger.Warnf("VM creation failed, cleaning up orphaned overlay files")
+			if rmErr := os.Remove(platformConfig.BlockStoragePath); rmErr != nil {
+				logger.WithError(rmErr).Errorf("Failed to remove overlay block storage: %s", platformConfig.BlockStoragePath)
+			} else {
+				logger.Infof("Removed orphaned overlay block storage: %s", platformConfig.BlockStoragePath)
+			}
+			if rmErr := os.Remove(platformConfig.AuxiliaryStoragePath); rmErr != nil {
+				logger.WithError(rmErr).Errorf("Failed to remove overlay auxiliary storage: %s", platformConfig.AuxiliaryStoragePath)
+			} else {
+				logger.Infof("Removed orphaned overlay auxiliary storage: %s", platformConfig.AuxiliaryStoragePath)
+			}
+		}
+	}()
 
 	vmConfig, err := config.NewVirtualMachineConfiguration(ctx, platformConfig, cpu, memorySize, networkInterfaceIdentifier, mounts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create virtual machine configuration: %w", err)
 	}
 
-	vmInstance, err := vm.NewVirtualMachineInstance(ctx, vmConfig)
+	vmInstance, err = vm.NewVirtualMachineInstance(ctx, vmConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create virtual machine instance: %w", err)
 	}

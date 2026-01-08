@@ -72,17 +72,10 @@ func NewPlatformConfiguration(ctx context.Context, opts MacPlatformConfiguration
 		return nil, fmt.Errorf("failed to create a new hardware model: %w", err)
 	}
 
-	// Create auxiliary storage (NVRAM)
-	// For Tart images, create fresh NVRAM to avoid state conflicts
-	// For ORAS images, load existing NVRAM as they're built specifically for this kubelet
-	var auxiliaryStorage *vz.MacAuxiliaryStorage
-	if opts.SourceFormat == "tart" {
-		log.G(ctx).Info("Creating fresh auxiliary storage for Tart image")
-		auxiliaryStorage, err = vz.NewMacAuxiliaryStorage(auxiliaryStoragePath, vz.WithCreatingMacAuxiliaryStorage(hardwareModel))
-	} else {
-		log.G(ctx).Info("Loading existing auxiliary storage")
-		auxiliaryStorage, err = vz.NewMacAuxiliaryStorage(auxiliaryStoragePath)
-	}
+	// Load auxiliary storage (NVRAM)
+	// Both Tart and ORAS images provide NVRAM that should be used as-is
+	log.G(ctx).Infof("Loading existing auxiliary storage from %s", auxiliaryStoragePath)
+	auxiliaryStorage, err := vz.NewMacAuxiliaryStorage(auxiliaryStoragePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create auxiliary storage: %w", err)
 	}

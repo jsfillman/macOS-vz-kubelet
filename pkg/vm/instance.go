@@ -165,15 +165,23 @@ func (i *VirtualMachineInstance) Stop(ctx context.Context) (err error) {
 	}
 
 	overlayBlockStoragePath, overlayAuxiliaryStoragePath, ok := i.config.GetOverlays()
-	logger.Debugf("Overlay block storage path: %s, overlay auxiliary storage path: %s", overlayBlockStoragePath, overlayAuxiliaryStoragePath)
+	logger.Debugf("Overlay block storage path: %s, overlay auxiliary storage path: %s, has overlays: %v", overlayBlockStoragePath, overlayAuxiliaryStoragePath, ok)
 	if ok {
-		logger.Debugf("Removing overlay files: %s, %s", overlayBlockStoragePath, overlayAuxiliaryStoragePath)
+		logger.Infof("Removing overlay files: %s, %s", overlayBlockStoragePath, overlayAuxiliaryStoragePath)
 		if rmErr := os.Remove(overlayBlockStoragePath); rmErr != nil {
+			logger.WithError(rmErr).Errorf("Failed to remove overlay block storage: %s", overlayBlockStoragePath)
 			err = errors.Join(err, rmErr)
+		} else {
+			logger.Infof("Successfully removed overlay block storage: %s", overlayBlockStoragePath)
 		}
 		if rmErr := os.Remove(overlayAuxiliaryStoragePath); rmErr != nil {
+			logger.WithError(rmErr).Errorf("Failed to remove overlay auxiliary storage: %s", overlayAuxiliaryStoragePath)
 			err = errors.Join(err, rmErr)
+		} else {
+			logger.Infof("Successfully removed overlay auxiliary storage: %s", overlayAuxiliaryStoragePath)
 		}
+	} else {
+		logger.Debug("No overlay files to remove")
 	}
 
 	return err
